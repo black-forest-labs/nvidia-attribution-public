@@ -30,6 +30,9 @@ def _build(spec: dict, ctx: dict) -> KaiExecutionContextAdapter:
         spec.get("placement_records_enabled", False),
         "eca.kai.placement_records_enabled",
     )
+    job_id_annotation = spec.get("job_id_annotation")
+    if job_id_annotation is not None and (not isinstance(job_id_annotation, str) or not job_id_annotation.strip()):
+        raise MCAError("eca.kai.job_id_annotation must be a non-empty string")
     daemon_spec = spec.get("kubernetes_daemon")
     if placement_records_enabled and daemon_spec is None:
         raise MCAError("eca.kai.placement_records_enabled requires eca.kai.kubernetes_daemon")
@@ -41,6 +44,7 @@ def _build(spec: dict, ctx: dict) -> KaiExecutionContextAdapter:
         namespace=spec.get("namespace"),
         timeout_seconds=timeout,
         placement_records_enabled=placement_records_enabled,
+        job_id_annotation=job_id_annotation,
         placement_reader=(
             build_kubernetes_daemon_client(
                 daemon_spec,
@@ -72,6 +76,9 @@ _registry.register_component(
         "namespace": _PARAM,
         "timeout_seconds": _PARAM,
         "placement_records_enabled": _PARAM,
+        # Pod annotation naming the job for PodGroups that no Job or JobSet
+        # owns. Unset, such PodGroups are skipped.
+        "job_id_annotation": _PARAM,
         "kubernetes_daemon": {
             "endpoint": _PARAM,
             "timeout_seconds": _PARAM,

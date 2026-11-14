@@ -151,6 +151,7 @@ def test_built_schema_has_expected_shape():
         "namespace",
         "timeout_seconds",
         "placement_records_enabled",
+        "job_id_annotation",
         "kubernetes_daemon",
     }
     assert set(schema["eca"]["_selector"]["kai"]["kubernetes_daemon"]) == {

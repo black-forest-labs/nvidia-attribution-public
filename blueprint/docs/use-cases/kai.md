@@ -87,9 +87,37 @@ return the same Pod UID and node with
 `nodeFailureReason` must be observed before deletion. The daemon reference
 defines retention and recovery limits.
 
+## PodGroups With No Owner
+
+Some launchers, such as SkyPilot, create bare Pods and their PodGroup
+themselves, so no Job or JobSet owns either. By default the adapter skips
+these PodGroups. Set `job_id_annotation` to a Pod annotation that carries the
+job's identity and the adapter emits them:
+
+```toml
+[eca.kai]
+namespace = "research-default"
+job_id_annotation = "skypilot-managed-job-id"
+```
+
+- `job_id` is the annotation's value, not `<namespace>/<name>`. Every member
+  Pod must carry one value. A group whose Pods lack it, or disagree on it, is
+  skipped.
+- The state comes from the member Pods alone: `FAILED` if any Pod failed,
+  `COMPLETED` if every Pod succeeded, `NODE_FAIL` for a node-loss signal on a
+  Pod, and `RUNNING` otherwise. A Pod can fail for reasons the workload did
+  not intend, so treat this state as weaker than an owner's terminal condition.
+- The end time is the latest container termination, or now while running.
+- `owner_kind`, `owner_name` and `owner_uid` are empty.
+- The PodGroup and its Pods must still exist. Launchers that delete both at
+  teardown leave nothing to discover afterwards, so this finds running jobs
+  and jobs whose Pods are still retained. Use the `kubernetes-daemon` to keep
+  placement after deletion.
+
 ## Current Scope
 
-- Supported owners: Kubernetes Jobs and JobSets.
+- Supported owners: Kubernetes Jobs and JobSets, plus ownerless PodGroups when
+  `job_id_annotation` is set.
 - Supported normalized states: `RUNNING`, `COMPLETED`, `FAILED`, `TIMEOUT`,
   and `NODE_FAIL`.
 - Job deadlines are forwarded from `activeDeadlineSeconds`; for JobSets, the

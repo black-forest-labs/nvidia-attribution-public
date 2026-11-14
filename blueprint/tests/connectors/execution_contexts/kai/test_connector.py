@@ -1195,3 +1195,125 @@ def test_builder_coerces_cli_and_environment_boolean_strings():
             {"placement_records_enabled": "sometimes"},
             ctx={"framework": "eca"},
         )
+
+
+# --- PodGroups with no owner: identity from the member Pods ---------------------
+
+JOB_ANNOTATION = "skypilot-managed-job-id"
+
+
+def _tagged_pod(name, job_id, **kwargs):
+    pod = _pod(name, **kwargs)
+    if job_id is not None:
+        pod["metadata"]["annotations"][JOB_ANNOTATION] = job_id
+    return pod
+
+
+def _bare_adapter():
+    return KaiExecutionContextAdapter(job_id_annotation=JOB_ANNOTATION)
+
+
+def test_unowned_podgroup_is_skipped_without_the_option(mocker):
+    _wire_kubectl(mocker, [_podgroup(owner=False)], [_tagged_pod("p0", "98572")])
+
+    assert KaiExecutionContextAdapter().discover_by_ids(["team-alpha/pg-a"]) == []
+
+
+def test_unowned_podgroup_takes_its_job_id_from_member_pods(mocker):
+    pods = [
+        _tagged_pod("p0", "98572", node="node001"),
+        _tagged_pod("p1", "98572", node="node002"),
+    ]
+    _wire_kubectl(mocker, [_podgroup(owner=False)], pods)
+
+    [ctx] = _bare_adapter().discover_by_ids(["team-alpha/pg-a"])
+
+    assert ctx["job_id"] == "98572"
+    assert ctx["id"] == ctx["attempt_id"] == ctx["pod_group_uid"] == "uid-pg-a"
+    assert ctx["nodes"] == ["node001", "node002"]
+    assert ctx["pod_nodes"] == {"p0": "node001", "p1": "node002"}
+    assert ctx["state"] == "RUNNING"
+    assert (ctx["owner_kind"], ctx["owner_name"], ctx["owner_uid"]) == ("", "", "")
+
+
+def test_unowned_running_group_ends_now(mocker):
+    _wire_kubectl(mocker, [_podgroup(owner=False)], [_tagged_pod("p0", "7", phase="Running")])
+
+    [ctx] = _bare_adapter().discover_by_ids(["team-alpha/pg-a"])
+
+    assert (datetime.now(tz=timezone.utc) - ctx["end_time"]).total_seconds() < 60
+
+
+def test_unowned_group_with_a_failed_pod_is_failed(mocker):
+    pods = [
+        _tagged_pod("p0", "7", phase="Running"),
+        _tagged_pod("p1", "7", phase="Failed", finished="2026-05-01T12:40:00Z"),
+    ]
+    _wire_kubectl(mocker, [_podgroup(owner=False)], pods)
+
+    [ctx] = _bare_adapter().discover_by_ids(["team-alpha/pg-a"])
+
+    assert ctx["state"] == "FAILED"
+    assert ctx["owner_state"] == "Failed"
+    assert ctx["end_time"] == datetime(2026, 5, 1, 12, 40, tzinfo=timezone.utc)
+
+
+def test_unowned_group_whose_pods_all_succeeded_is_completed(mocker):
+    pods = [
+        _tagged_pod("p0", "7", phase="Succeeded", finished="2026-05-01T12:30:00Z"),
+        _tagged_pod("p1", "7", phase="Succeeded", finished="2026-05-01T12:35:00Z"),
+    ]
+    _wire_kubectl(mocker, [_podgroup(owner=False)], pods)
+
+    [ctx] = _bare_adapter().discover_by_ids(["team-alpha/pg-a"])
+
+    assert ctx["state"] == "COMPLETED"
+    assert ctx["end_time"] == datetime(2026, 5, 1, 12, 35, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "pods",
+    [
+        [_tagged_pod("p0", None)],
+        [_tagged_pod("p0", "")],
+        [_tagged_pod("p0", "7"), _tagged_pod("p1", "8")],
+        [],
+    ],
+    ids=["no annotation", "empty annotation", "members disagree", "no members"],
+)
+def test_unowned_group_without_one_job_identity_is_skipped(mocker, pods):
+    _wire_kubectl(mocker, [_podgroup(owner=False)], pods)
+
+    assert _bare_adapter().discover_by_ids(["team-alpha/pg-a"]) == []
+
+
+def test_owned_podgroup_keeps_its_owner_identity_when_the_option_is_set(mocker):
+    pods = [_pod("p0", controller=("Job", "uid-job-uid-pg-a"))]
+    pods[0]["metadata"]["annotations"][JOB_ANNOTATION] = "999"
+    _wire_kubectl(
+        mocker,
+        [_podgroup()],
+        pods,
+        [_job("pg-a-job", "uid-job-uid-pg-a", completed="2026-05-01T12:30:00Z")],
+    )
+
+    [ctx] = _bare_adapter().discover_by_ids(["team-alpha/pg-a"])
+
+    assert ctx["job_id"] == "team-alpha/pg-a"
+    assert ctx["owner_kind"] == "Job"
+
+
+def test_unowned_group_is_found_by_time_range_discovery(mocker):
+    _wire_kubectl(mocker, [_podgroup(owner=False)], [_tagged_pod("p0", "98572")])
+    adapter = KaiExecutionContextAdapter(namespace="team-alpha", job_id_annotation=JOB_ANNOTATION)
+
+    [ctx] = adapter.discover_by_time_range(START, datetime(2030, 1, 1, tzinfo=timezone.utc))
+
+    assert ctx["job_id"] == "98572"
+
+
+@pytest.mark.parametrize("value", ["", "  ", 5])
+def test_job_id_annotation_must_be_a_non_empty_string(value):
+    component = mca_registry.get_component("eca", "kai")
+    with pytest.raises(MCAError, match="job_id_annotation"):
+        component.build({"job_id_annotation": value}, ctx={"framework": "eca"})

@@ -417,6 +417,7 @@ placement_records_enabled = false
 | `namespace`                   | No       | all namespaces  | Optional namespace scope. Also allows bare PodGroup names in `ids` mode. Required when `placement_records_enabled` is set.   |
 | `timeout_seconds`             | No       | `60`            | Timeout for each Kubernetes API request.                                                                                     |
 | `placement_records_enabled`   | No       | `false`         | Reads retained placement from the configured `kubernetes-daemon`; discovery fails if it cannot be read. Requires `namespace`, matching the one namespace the daemon watches. |
+| `job_id_annotation`           | No       | none            | Pod annotation that names the job when no Job or JobSet owns the PodGroup, for example `skypilot-managed-job-id`. Without it, ownerless PodGroups are skipped. See [Attribute KAI PodGroups](./use-cases/kai.md#podgroups-with-no-owner). |
 
 The baseline KAI adapter does not require `kubernetes-daemon`. It uses live
 Pods only. If Pods are cleaned up before attribution, the execution context

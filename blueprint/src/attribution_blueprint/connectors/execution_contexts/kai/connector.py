@@ -400,10 +400,143 @@ def _parse_pod_group(
     return ctx
 
 
+def _unowned_state(members: list[dict]) -> tuple[str, str]:
+    """State of a PodGroup with no owner, read from its member Pods alone.
+
+    Without a Job or JobSet there is no terminal signal of the workload's
+    own, so a failed Pod is the only evidence of failure and a group whose
+    Pods all succeeded is COMPLETED. Anything else is still running. Returns
+    (service-facing state, native wording).
+    """
+    phases = [(pod.get("status") or {}).get("phase") for pod in members]
+    if "Failed" in phases:
+        return "FAILED", "Failed"
+    if phases and all(phase == "Succeeded" for phase in phases):
+        return "COMPLETED", "Succeeded"
+    return "RUNNING", "Active"
+
+
+def _pods_finished_at(members: list[dict]) -> datetime | None:
+    """Latest container termination time across the member Pods, if any."""
+    finished = [
+        done
+        for pod in members
+        for status in (pod.get("status") or {}).get("containerStatuses") or []
+        if (done := _parse_dt(((status.get("state") or {}).get("terminated") or {}).get("finishedAt"))) is not None
+    ]
+    return max(finished) if finished else None
+
+
+def _parse_unowned_pod_group(
+    podgroup: dict,
+    pods: list[dict],
+    job_id_annotation: str,
+    now: datetime,
+) -> KaiExecutionContext | None:
+    """Normalize a PodGroup that has no Job or JobSet owner.
+
+    A bare-Pod launcher (SkyPilot, for one) creates the Pods and the PodGroup
+    itself, so nothing owns them. The job's identity is read from
+    `job_id_annotation` on the member Pods instead. All members must agree on
+    one value: none means the launcher gave no identity, and several mean the
+    group mixes jobs, so either way the PodGroup is skipped rather than
+    guessed at.
+
+    The state and end time come from the Pods alone (see `_unowned_state`).
+    """
+    meta = podgroup.get("metadata") or {}
+    uid = meta.get("uid")
+    name = meta.get("name")
+    namespace = meta.get("namespace")
+    if not uid or not name or not namespace:
+        logger.warning(f"podgroup missing uid/name/namespace; skipping: {meta!r}")
+        return None
+    start_time = _parse_dt(meta.get("creationTimestamp"))
+    if start_time is None:
+        logger.warning(f"podgroup {namespace}/{name} has no creationTimestamp; skipping")
+        return None
+
+    identities = {
+        value
+        for pod in pods
+        if isinstance(value := ((pod.get("metadata") or {}).get("annotations") or {}).get(job_id_annotation), str)
+        and value
+    }
+    if len(identities) != 1:
+        reason = "no member Pod carries" if not identities else f"member Pods disagree on ({sorted(identities)})"
+        logger.info(f"podgroup {namespace}/{name}: {reason} the {job_id_annotation!r} annotation; skipping")
+        return None
+    job_id = next(iter(identities))
+
+    member_starts = [
+        created
+        for pod in pods
+        if (created := _parse_dt((pod.get("metadata") or {}).get("creationTimestamp"))) is not None
+    ]
+    if member_starts:
+        start_time = min(start_time, *member_starts)
+    pod_nodes = {
+        pod_name: node
+        for pod in pods
+        if (pod_name := (pod.get("metadata") or {}).get("name")) and (node := (pod.get("spec") or {}).get("nodeName"))
+    }
+    pod_names = sorted(pod_name for pod in pods if (pod_name := (pod.get("metadata") or {}).get("name")))
+
+    state, owner_state = _unowned_state(pods)
+    finished = _pods_finished_at(pods) if state != "RUNNING" else None
+    end_time = max(finished if finished is not None else now, start_time)
+    node_loss_nodes = sorted(
+        {node for pod in pods if pod_node_failure_reason(pod) and (node := (pod.get("spec") or {}).get("nodeName"))}
+    )
+    if state != "COMPLETED" and node_loss_nodes:
+        state = "NODE_FAIL"
+    if not pod_nodes:
+        logger.warning(f"podgroup {namespace}/{name}: node list unavailable from member Pods")
+
+    spec = podgroup.get("spec") or {}
+    ctx: KaiExecutionContext = {
+        "id": uid,
+        "workload_type": "kai",
+        "scheduler": "kai",
+        "nodes": sorted(set(pod_nodes.values())),
+        "start_time": start_time,
+        "end_time": end_time,
+        "state": state,
+        "job_id": job_id,
+        "pod_group_uid": uid,
+        "attempt_id": uid,
+        "namespace": namespace,
+        "name": name,
+        "podgroup_shape": _podgroup_shape(spec),
+        "owner_kind": "",
+        "owner_name": "",
+        "owner_uid": "",
+        "owner_state": owner_state,
+    }
+    if state == "NODE_FAIL":
+        ctx["failed_node"] = node_loss_nodes[0]
+    if queue_name := spec.get("queue"):
+        ctx["queue_name"] = queue_name
+    if (min_member := _non_negative_int(spec.get("minMember"))) is not None:
+        ctx["min_member"] = min_member
+    status = podgroup.get("status") or {}
+    if isinstance(conditions := status.get("schedulingConditions"), list):
+        ctx["scheduling_conditions"] = conditions
+    if "resourcesStatus" in status:
+        ctx["resources_status"] = status["resourcesStatus"]
+    if pod_names:
+        ctx["pod_names"] = pod_names
+    if pod_nodes:
+        ctx["pod_nodes"] = pod_nodes
+    return ctx
+
+
 class KaiExecutionContextAdapter:
     """ExecutionContextAdapter that discovers KAI PodGroups via Kubernetes.
 
     `kubeconfig` and `context` configure the shared persistent API client.
+    `job_id_annotation` opts in to PodGroups that have no Job or JobSet owner:
+    their job identity is read from that annotation on the member Pods.
     `namespace` selects the namespace used for time-range discovery; ID
     discovery can instead carry a namespace in each ID.
     """
@@ -416,7 +549,13 @@ class KaiExecutionContextAdapter:
         timeout_seconds: int = 60,
         placement_records_enabled: bool = False,
         placement_reader: PlacementReader | None = None,
+        job_id_annotation: str | None = None,
     ):
+        if job_id_annotation is not None and not job_id_annotation.strip():
+            raise ValueError("job_id_annotation must be a non-empty string")
+        # Pod annotation that names the job when no Job or JobSet owns the
+        # PodGroup. None keeps owner-only behaviour: ownerless PodGroups are skipped.
+        self.job_id_annotation = job_id_annotation
         self.namespace = namespace or ""
         self.timeout_seconds = timeout_seconds
         if not isinstance(placement_records_enabled, bool):
@@ -516,20 +655,24 @@ class KaiExecutionContextAdapter:
         # Unsupported owners cannot supply an end time, so drop them before
         # fetching Pods or owners.
         owned: list[tuple[dict, dict, str]] = []
+        unowned: list[dict] = []
         for podgroup in podgroups:
             meta = podgroup.get("metadata") or {}
             owner = _resolve_owner(meta)
             owner_resource = _owner_resource(owner) if owner is not None else None
             if owner is None or owner_resource is None:
+                if self.job_id_annotation is not None:
+                    unowned.append(podgroup)
+                    continue
                 logger.info(
                     f"podgroup {meta.get('namespace')}/{meta.get('name')}: "
                     "not owned by a supported Job or JobSet; skipping"
                 )
                 continue
             owned.append((podgroup, owner, owner_resource))
-        if not owned:
+        if not owned and not unowned:
             return []
-        pods_by_key = _index_pods_by_pod_group(self._fetch_pods([pg for pg, _, _ in owned]))
+        pods_by_key = _index_pods_by_pod_group(self._fetch_pods([pg for pg, _, _ in owned] + unowned))
         now = datetime.now(tz=timezone.utc)
         contexts: list[KaiExecutionContext] = []
         for podgroup, owner, owner_resource in owned:
@@ -569,6 +712,22 @@ class KaiExecutionContextAdapter:
                 owner_jobs,
                 pods_by_key.get((namespace, meta.get("name") or ""), []),
                 owner_object,
+                now,
+            )
+            if ctx is None:
+                continue
+            if time_range is not None:
+                start, end = time_range
+                if ctx["start_time"] > end or ctx["end_time"] < start:
+                    continue
+            self._merge_placement_records(ctx)
+            contexts.append(ctx)
+        for podgroup in unowned:
+            meta = podgroup.get("metadata") or {}
+            ctx = _parse_unowned_pod_group(
+                podgroup,
+                pods_by_key.get((meta.get("namespace") or "", meta.get("name") or ""), []),
+                self.job_id_annotation,
                 now,
             )
             if ctx is None:
